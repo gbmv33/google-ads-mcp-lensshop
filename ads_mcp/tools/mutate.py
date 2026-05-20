@@ -1,9 +1,10 @@
 # LensShop customization — Google Ads write operations via MCP
 #
-# Adds three mutation tools not present in the upstream package:
-#   - set_campaign_status    (enable / pause a campaign)
-#   - update_campaign_budget (change daily budget in BRL)
+# Adds four mutation tools not present in the upstream package:
+#   - set_campaign_status      (enable / pause a campaign)
+#   - update_campaign_budget   (change daily budget in BRL)
 #   - set_campaign_target_roas (set Target ROAS on Maximize Conversion Value campaigns)
+#   - rename_campaign          (rename a campaign)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -150,3 +151,37 @@ def set_campaign_target_roas(
     else:
         roas_str = "removed (unconstrained Maximize Conversion Value)"
     return f"OK: Campaign {campaign_id} Target ROAS set to {roas_str}. Resource: {resource}"
+
+
+@mcp.tool()
+def rename_campaign(
+    customer_id: str,
+    campaign_id: str,
+    new_name: str,
+) -> str:
+    """Rename a Google Ads campaign.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The campaign ID to rename (e.g. '21187695750')
+        new_name: The new display name for the campaign
+    """
+    client = utils.get_googleads_client()
+    campaign_service = utils.get_googleads_service("CampaignService")
+
+    campaign_operation = client.get_type("CampaignOperation")
+    campaign = campaign_operation.update
+    campaign.resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
+    campaign.name = new_name
+
+    campaign_operation.update_mask.CopyFrom(
+        field_mask_pb2.FieldMask(paths=["name"])
+    )
+
+    response = campaign_service.mutate_campaigns(
+        customer_id=str(customer_id),
+        operations=[campaign_operation],
+    )
+
+    resource = response.results[0].resource_name
+    return f"OK: Campaign {campaign_id} renamed to '{new_name}'. Resource: {resource}"
