@@ -1,0 +1,20 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - lensshop/mutate-tools
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger deploy webhook on VPS
+        run: |
+          PAYLOAD='{"ref":"lensshop/mutate-tools"}'
+          SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.DEPLOY_WEBHOOK_SECRET }}" | sed 's/.*= //')
+          curl -sf -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=${SIG}" \
+            -d "$PAYLOAD" \
+            https://lensconfig.redeastrum.com.br/ads-deploy
