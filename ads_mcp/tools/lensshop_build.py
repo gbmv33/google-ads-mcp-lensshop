@@ -6,7 +6,8 @@
 #   - add_keywords                   (positive keywords on an ad group)
 #   - add_campaign_negative_keywords (campaign-level negatives)
 #   - create_responsive_search_ad    (RSA with length validation)
-#   - set_conversion_action_primary  (toggle primary_for_goal on a conversion action)
+#
+# set_conversion_action_primary lives in mutate.py (CLI version kept on merge).
 #
 # Each tool delegates to a plain *_impl function so scripts on the VPS can
 # reuse the logic without going through the MCP layer.
@@ -16,7 +17,6 @@
 from typing import Literal
 from ads_mcp.coordinator import mcp
 import ads_mcp.utils as utils
-from google.protobuf import field_mask_pb2
 
 MAX_HEADLINE_LEN = 30
 MAX_DESCRIPTION_LEN = 90
@@ -259,26 +259,6 @@ def create_responsive_search_ad_impl(
     return {"ad_resource": resource}
 
 
-def set_conversion_action_primary_impl(
-    customer_id: str,
-    conversion_action_id: str,
-    primary: bool,
-) -> str:
-    client = utils.get_googleads_client()
-    service = utils.get_googleads_service("ConversionActionService")
-    op = client.get_type("ConversionActionOperation")
-    ca = op.update
-    ca.resource_name = (
-        f"customers/{customer_id}/conversionActions/{conversion_action_id}"
-    )
-    ca.primary_for_goal = primary
-    op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["primary_for_goal"]))
-    resp = service.mutate_conversion_actions(
-        customer_id=str(customer_id), operations=[op]
-    )
-    return resp.results[0].resource_name
-
-
 # ---------------------------------------------------------------------------
 # MCP tool wrappers
 # ---------------------------------------------------------------------------
@@ -411,23 +391,3 @@ def create_responsive_search_ad(
     except ValueError as e:
         return f"Error: {e}"
     return f"OK: RSA created in ad group {ad_group_id}. Resource: {result['ad_resource']}"
-
-
-@mcp.tool()
-def set_conversion_action_primary(
-    customer_id: str,
-    conversion_action_id: str,
-    primary: bool,
-) -> str:
-    """Set whether a conversion action is primary (feeds bidding) or secondary (observation only).
-
-    Args:
-        customer_id: The customer/account ID without hyphens
-        conversion_action_id: The conversion action ID to update
-        primary: True = primary (biddable), False = secondary (observation)
-    """
-    resource = set_conversion_action_primary_impl(
-        customer_id, conversion_action_id, primary
-    )
-    label = "PRIMARY (feeds bidding)" if primary else "SECONDARY (observation only)"
-    return f"OK: Conversion action {conversion_action_id} is now {label}. Resource: {resource}"
