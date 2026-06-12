@@ -1,10 +1,11 @@
 # LensShop customization — Google Ads write operations via MCP
 #
-# Adds four mutation tools not present in the upstream package:
-#   - set_campaign_status      (enable / pause a campaign)
-#   - update_campaign_budget   (change daily budget in BRL)
-#   - set_campaign_target_roas (set Target ROAS on Maximize Conversion Value campaigns)
-#   - rename_campaign          (rename a campaign)
+# Adds mutation tools not present in the upstream package:
+#   - set_campaign_status        (enable / pause a campaign)
+#   - update_campaign_budget     (change daily budget in BRL)
+#   - set_campaign_target_roas   (set Target ROAS on Maximize Conversion Value campaigns)
+#   - rename_campaign            (rename a campaign)
+#   - create_conversion_action   (create a new conversion action and return its label)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -187,134 +188,197 @@ def rename_campaign(
     return f"OK: Campaign {campaign_id} renamed to '{new_name}'. Resource: {resource}"
 
 
-# ── Asset Group tools (LensShop addition) ─────────────────────────────────────
-
 @mcp.tool()
-def update_asset_group_urls(
+def create_conversion_action(
     customer_id: str,
-    asset_group_id: str,
-    final_url: str,
-    path1: str = "",
-    path2: str = "",
+    name: str,
+    category: Literal["PURCHASE", "ADD_TO_CART", "BEGIN_CHECKOUT", "CONTACT", "PAGE_VIEW"] = "PURCHASE",
+    counting_type: Literal["ONE_PER_CLICK", "MANY_PER_CLICK"] = "ONE_PER_CLICK",
+    default_value: float = 0.0,
+    always_use_default_value: bool = False,
+    click_through_lookback_days: int = 30,
 ) -> str:
-    """Update the final URL and display paths of a PMax asset group.
+    """Create a new Google Ads conversion action of type WEBPAGE and return its conversion label.
+
+    Use this to create a purchase (or other) conversion action that can then be
+    set as the destination in Shopify's Google & YouTube app → Settings →
+    Conversion measurement → custom destination field.
 
     Args:
-        customer_id: Account ID without hyphens (e.g. '5521940727')
-        asset_group_id: Asset group ID (e.g. '6713279038')
-        final_url: Landing page URL (e.g. 'https://www.lensshop.com.br/collections/lentes-de-contato')
-        path1: First display path shown after domain (e.g. 'lentes-de-contato')
-        path2: Second display path — leave empty if not needed
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        name: Display name for the conversion action (e.g. 'Compra Shopify — Customer Events')
+        category: Conversion category. PURCHASE for sales, ADD_TO_CART, BEGIN_CHECKOUT, etc.
+        counting_type: ONE_PER_CLICK (recommended for purchases) or MANY_PER_CLICK
+        default_value: Default monetary value when no value is passed (0.0 = dynamic value)
+        always_use_default_value: If True, ignore dynamic values and always use default_value
+        click_through_lookback_days: Attribution window in days (default 30)
     """
     client = utils.get_googleads_client()
-    ag_service = utils.get_googleads_service("AssetGroupService")
+    conversion_service = client.get_service("ConversionActionService")
 
-    ag_op = client.get_type("AssetGroupOperation")
-    ag = ag_op.update
-    ag.resource_name = f"customers/{customer_id}/assetGroups/{asset_group_id}"
-    ag.final_urls[:] = [final_url]
-    ag.path1 = path1
-    ag.path2 = path2
+    operation = client.get_type("ConversionActionOperation")
+    ca = operation.create
 
-    ag_op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["final_urls", "path1", "path2"]))
+    ca.name = name
+    ca.status = client.enums.ConversionActionStatusEnum.ENABLED
 
-    response = ag_service.mutate_asset_groups(customer_id=str(customer_id), operations=[ag_op])
-    resource = response.results[0].resource_name
-    display = f"{final_url.replace('https://', '').replace('http://', '').split('/')[0]}/{path1}/{path2}".rstrip("/")
-    return f"OK: Asset group {asset_group_id} URL → {final_url} | display: {display}. Resource: {resource}"
+    category_map = {
+        "PURCHASE": client.enums.ConversionActionCategoryEnum.PURCHASE,
+        "ADD_TO_CART": client.enums.ConversionActionCategoryEnum.ADD_TO_CART,
+        "BEGIN_CHECKOUT": client.enums.ConversionActionCategoryEnum.BEGIN_CHECKOUT,
+        "CONTACT": client.enums.ConversionActionCategoryEnum.CONTACT,
+        "PAGE_VIEW": client.enums.ConversionActionCategoryEnum.PAGE_VIEW,
+    }
+    ca.category = category_map.get(category, client.enums.ConversionActionCategoryEnum.PURCHASE)
+    ca.type_ = client.enums.ConversionActionTypeEnum.WEBPAGE
 
+    counting_map = {
+        "ONE_PER_CLICK": client.enums.ConversionActionCountingTypeEnum.ONE_PER_CLICK,
+        "MANY_PER_CLICK": client.enums.ConversionActionCountingTypeEnum.MANY_PER_CLICK,
+    }
+    ca.counting_type = counting_map.get(counting_type, client.enums.ConversionActionCountingTypeEnum.ONE_PER_CLICK)
 
-@mcp.tool()
-def add_text_asset_to_group(
-    customer_id: str,
-    asset_group_id: str,
-    text: str,
-    field_type: str,
-) -> str:
-    """Add a new headline, long headline or description to a PMax asset group.
+    ca.value_settings.default_value = default_value
+    ca.value_settings.always_use_default_value = always_use_default_value
+    ca.click_through_lookback_window_days = click_through_lookback_days
+    ca.view_through_lookback_window_days = 1
 
-    Args:
-        customer_id: Account ID without hyphens
-        asset_group_id: Asset group ID (e.g. '6713279038')
-        text: Text content of the asset
-        field_type: HEADLINE (max 30 chars), LONG_HEADLINE (max 90 chars), DESCRIPTION (max 90 chars)
-    """
-    limits = {"HEADLINE": 30, "LONG_HEADLINE": 90, "DESCRIPTION": 90}
-    if field_type not in limits:
-        return f"Error: field_type must be one of {list(limits.keys())}"
-    if len(text) > limits[field_type]:
-        return f"Error: '{text}' has {len(text)} chars — {field_type} max is {limits[field_type]}."
-
-    client = utils.get_googleads_client()
-
-    # Step 1 — create text asset
-    asset_service = utils.get_googleads_service("AssetService")
-    asset_op = client.get_type("AssetOperation")
-    asset = asset_op.create
-    asset.text_asset.text = text
-    asset.name = text[:50]
-
-    asset_resp = asset_service.mutate_assets(customer_id=str(customer_id), operations=[asset_op])
-    asset_resource = asset_resp.results[0].resource_name
-
-    # Step 2 — link asset to asset group
-    aga_service = utils.get_googleads_service("AssetGroupAssetService")
-    aga_op = client.get_type("AssetGroupAssetOperation")
-    aga = aga_op.create
-    aga.asset_group = f"customers/{customer_id}/assetGroups/{asset_group_id}"
-    aga.asset = asset_resource
-    aga.field_type = getattr(client.enums.AssetFieldTypeEnum, field_type)
-
-    aga_resp = aga_service.mutate_asset_group_assets(customer_id=str(customer_id), operations=[aga_op])
-    aga_resource = aga_resp.results[0].resource_name
-    return f"OK: {field_type} "{text}" added to asset group {asset_group_id}. Resource: {aga_resource}"
-
-
-@mcp.tool()
-def remove_asset_from_group(
-    customer_id: str,
-    asset_group_id: str,
-    asset_resource_name: str,
-    field_type: str,
-) -> str:
-    """Remove an asset (headline, description, image) from a PMax asset group.
-
-    Args:
-        customer_id: Account ID without hyphens
-        asset_group_id: Asset group ID (e.g. '6713279038')
-        asset_resource_name: Full asset resource name from search results
-                             (e.g. 'customers/5521940727/assets/122065521208')
-        field_type: HEADLINE, LONG_HEADLINE, DESCRIPTION, AD_IMAGE, MARKETING_IMAGE,
-                    SQUARE_MARKETING_IMAGE, PORTRAIT_MARKETING_IMAGE, YOUTUBE_VIDEO
-    """
-    client = utils.get_googleads_client()
-    ga_service = utils.get_googleads_service("GoogleAdsService")
-
-    # Resolve exact resource name via query (avoids manually constructing enum int)
-    ag_resource = f"customers/{customer_id}/assetGroups/{asset_group_id}"
-    query = (
-        f"SELECT asset_group_asset.resource_name "
-        f"FROM asset_group_asset "
-        f"WHERE asset_group_asset.asset_group = "{ag_resource}" "
-        f"AND asset_group_asset.asset = "{asset_resource_name}" "
-        f"AND asset_group_asset.field_type = "{field_type}""
+    response = conversion_service.mutate_conversion_actions(
+        customer_id=str(customer_id),
+        operations=[operation],
     )
+
+    resource_name = response.results[0].resource_name
+    conversion_action_id = resource_name.split("/")[-1]
+
+    # Fetch the conversion label (tag snippet) right after creation
+    ga_service = client.get_service("GoogleAdsService")
+    query = (
+        f"SELECT conversion_action.id, conversion_action.name, "
+        f"conversion_action.tag_snippets "
+        f"FROM conversion_action "
+        f"WHERE conversion_action.id = {conversion_action_id}"
+    )
+    label = None
     stream = ga_service.search_stream(customer_id=str(customer_id), query=query)
-    resource_name = None
     for batch in stream:
         for row in batch.results:
-            resource_name = row.asset_group_asset.resource_name
-            break
-        if resource_name:
-            break
+            for snippet in row.conversion_action.tag_snippets:
+                # page_format 2 = HTML, type_ 2 = event snippet
+                if snippet.page_format == 2 and snippet.type_ == 2:
+                    import re
+                    match = re.search(r"AW-\d+/[\w-]+", snippet.event_snippet)
+                    if match:
+                        label = match.group(0)
+                        break
+            if label:
+                break
 
-    if not resource_name:
-        return f"Error: asset '{asset_resource_name}' with field_type {field_type} not found in group {asset_group_id}."
+    result = (
+        f"OK: Conversion action '{name}' created.\n"
+        f"  ID: {conversion_action_id}\n"
+        f"  Resource: {resource_name}\n"
+    )
+    if label:
+        result += f"  Conversion label: {label}\n"
+        result += f"\nUse this in Shopify → Google app → Conversion settings → Destino personalizado:\n  {label}"
+    else:
+        result += f"  (Label not yet available — query conversion_action {conversion_action_id} in a few minutes)"
 
-    aga_service = utils.get_googleads_service("AssetGroupAssetService")
-    aga_op = client.get_type("AssetGroupAssetOperation")
-    aga_op.remove = resource_name
+    return result
 
-    aga_service.mutate_asset_group_assets(customer_id=str(customer_id), operations=[aga_op])
-    asset_id = asset_resource_name.split("/")[-1]
-    return f"OK: Asset {asset_id} ({field_type}) removed from asset group {asset_group_id}."
+
+@mcp.tool()
+def set_campaign_ad_schedule(
+    customer_id: str,
+    campaign_id: str,
+    start_hour: int,
+    end_hour: int,
+    days: list[str] | None = None,
+) -> str:
+    """Set ad schedule (day-parting) for a Google Ads campaign.
+
+    Replaces all existing ad schedule criteria with a new time window.
+    For Performance Max campaigns, ad scheduling controls when the campaign
+    is allowed to serve -- it does not support bid adjustments per hour.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The campaign ID to configure (e.g. '23846742651')
+        start_hour: Hour to START serving, 0-23 (e.g. 8 for 08:00)
+        end_hour: Hour to STOP serving, 1-24 (e.g. 23 for 23:00)
+        days: Days to apply the schedule. Defaults to all 7 days.
+              Valid values: MONDAY TUESDAY WEDNESDAY THURSDAY FRIDAY SATURDAY SUNDAY
+    """
+    if days is None:
+        days = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+
+    client = utils.get_googleads_client()
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+    criterion_service = utils.get_googleads_service("CampaignCriterionService")
+
+    query = (
+        f"SELECT campaign_criterion.resource_name "
+        f"FROM campaign_criterion "
+        f"WHERE campaign.id = {campaign_id} "
+        f"AND campaign_criterion.type = 'AD_SCHEDULE'"
+    )
+    stream = ga_service.search_stream(customer_id=str(customer_id), query=query)
+    remove_ops = []
+    for batch in stream:
+        for row in batch.results:
+            op = client.get_type("CampaignCriterionOperation")
+            op.remove = row.campaign_criterion.resource_name
+            remove_ops.append(op)
+
+    removed_count = 0
+    if remove_ops:
+        criterion_service.mutate_campaign_criteria(
+            customer_id=str(customer_id),
+            operations=remove_ops,
+        )
+        removed_count = len(remove_ops)
+
+    day_enum_map = {
+        "MONDAY":    client.enums.DayOfWeekEnum.MONDAY,
+        "TUESDAY":   client.enums.DayOfWeekEnum.TUESDAY,
+        "WEDNESDAY": client.enums.DayOfWeekEnum.WEDNESDAY,
+        "THURSDAY":  client.enums.DayOfWeekEnum.THURSDAY,
+        "FRIDAY":    client.enums.DayOfWeekEnum.FRIDAY,
+        "SATURDAY":  client.enums.DayOfWeekEnum.SATURDAY,
+        "SUNDAY":    client.enums.DayOfWeekEnum.SUNDAY,
+    }
+
+    create_ops = []
+    for day_name in days:
+        day_key = day_name.upper()
+        if day_key not in day_enum_map:
+            return (
+                f"Error: dia invalido '{day_name}'. "
+                f"Use: MONDAY TUESDAY WEDNESDAY THURSDAY FRIDAY SATURDAY SUNDAY"
+            )
+        op = client.get_type("CampaignCriterionOperation")
+        criterion = op.create
+        criterion.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
+        criterion.ad_schedule.day_of_week = day_enum_map[day_key]
+        criterion.ad_schedule.start_hour = start_hour
+        criterion.ad_schedule.start_minute = client.enums.MinuteOfHourEnum.ZERO
+        criterion.ad_schedule.end_hour = end_hour
+        criterion.ad_schedule.end_minute = client.enums.MinuteOfHourEnum.ZERO
+        create_ops.append(op)
+
+    response = criterion_service.mutate_campaign_criteria(
+        customer_id=str(customer_id),
+        operations=create_ops,
+    )
+
+    created_count = len(response.results)
+    days_str = ", ".join(days)
+    return (
+        f"OK: Programacao de anuncios configurada para a campanha {campaign_id}.\n"
+        f"  Criterios anteriores removidos: {removed_count}\n"
+        f"  Novos criterios criados: {created_count}\n"
+        f"  Horario: {start_hour:02d}:00 - {end_hour:02d}:00\n"
+        f"  Dias: {days_str}\n"
+        f"  A campanha nao exibira anuncios fora desse intervalo."
+    )
