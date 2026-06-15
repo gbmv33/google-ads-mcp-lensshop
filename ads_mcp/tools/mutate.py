@@ -19,6 +19,7 @@
 #   - upload_logo_to_campaign              (upload a logo and link at campaign level — required when Brand Guidelines is enabled)
 #   - add_negative_keywords                (bulk-add negative broad-match keywords to a campaign)
 #   - set_campaign_geo_target_type         (change positive geo target type, e.g. PRESENCE_OR_INTEREST → PRESENCE)
+#   - set_recommendation_subscription_status (enable/pause an account-level recommendation auto-apply)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -1099,3 +1100,62 @@ def set_campaign_geo_target_type(
         f"OK: Campanha {campaign_id} geo target type alterado para {positive_geo_target_type}.\n"
         f"  Resource: {resource}"
     )
+
+
+@mcp.tool()
+def set_recommendation_subscription_status(
+    customer_id: str,
+    recommendation_type: str,
+    status: Literal["ENABLED", "PAUSED"],
+) -> str:
+    """Enable or pause a recommendation subscription (Google's auto-apply).
+
+    Use this to control which recommendations Google may auto-apply on the
+    account. Pause types you do NOT want auto-applied (e.g. RESPONSIVE_SEARCH_AD,
+    SET_TARGET_ROAS, USE_BROAD_MATCH_KEYWORD). For Lensshop policy all
+    subscriptions must remain PAUSED.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        recommendation_type: Recommendation type enum value. Common: 
+            RESPONSIVE_SEARCH_AD, KEYWORD, OPTIMIZE_AD_ROTATION,
+            TARGET_CPA_OPT_IN, MAXIMIZE_CONVERSIONS_OPT_IN,
+            MAXIMIZE_CONVERSION_VALUE_OPT_IN, TARGET_ROAS_OPT_IN,
+            MAXIMIZE_CLICKS_OPT_IN, DISPLAY_EXPANSION_OPT_IN,
+            USE_BROAD_MATCH_KEYWORD, RESPONSIVE_SEARCH_AD_IMPROVE_AD_STRENGTH,
+            SET_TARGET_ROAS, RAISE_TARGET_CPA, LOWER_TARGET_ROAS, SET_TARGET_CPA.
+            Discover the full live set via: search recommendation_subscription.
+        status: New status. ENABLED to allow auto-apply, PAUSED to block it.
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("RecommendationSubscriptionService")
+
+    operation = client.get_type("RecommendationSubscriptionOperation")
+    sub = operation.update
+    sub.resource_name = (
+        f"customers/{customer_id}/recommendationSubscriptions/{recommendation_type}"
+    )
+
+    status_enum = client.enums.RecommendationSubscriptionStatusEnum
+    if status == "ENABLED":
+        sub.status = status_enum.ENABLED
+    elif status == "PAUSED":
+        sub.status = status_enum.PAUSED
+    else:
+        return f"Error: invalid status '{status}'. Use ENABLED or PAUSED."
+
+    operation.update_mask.CopyFrom(
+        field_mask_pb2.FieldMask(paths=["status"])
+    )
+
+    response = service.mutate_recommendation_subscription(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+
+    resource = response.results[0].resource_name
+    return (
+        f"OK: recommendation_subscription [{recommendation_type}] is now {status}. "
+        f"Resource: {resource}"
+    )
+
