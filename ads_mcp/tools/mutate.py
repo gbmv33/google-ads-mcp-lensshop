@@ -20,6 +20,7 @@
 #   - add_negative_keywords                (bulk-add negative broad-match keywords to a campaign)
 #   - set_campaign_geo_target_type         (change positive geo target type, e.g. PRESENCE_OR_INTEREST → PRESENCE)
 #   - set_recommendation_subscription_status (enable/pause an account-level recommendation auto-apply)
+#   - set_ad_group_ad_status              (enable/pause/remove a single ad — required to retire an RSA)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -1157,5 +1158,58 @@ def set_recommendation_subscription_status(
     return (
         f"OK: recommendation_subscription [{recommendation_type}] is now {status}. "
         f"Resource: {resource}"
+    )
+
+
+@mcp.tool()
+def set_ad_group_ad_status(
+    customer_id: str,
+    ad_group_id: str,
+    ad_id: str,
+    status: Literal["ENABLED", "PAUSED", "REMOVED"],
+) -> str:
+    """Enable, pause, or remove a single ad within an ad group.
+
+    Required to take an RSA out of rotation after creating a replacement,
+    since Google Ads does not allow editing final_url on an existing RSA
+    (the standard pattern is create-new + pause-old).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        ad_group_id: The ad group ID containing the ad (e.g. '196940702306')
+        ad_id: The numeric ad ID to update (e.g. '812664910058')
+        status: New status. ENABLED to activate, PAUSED to take out of rotation,
+                REMOVED to permanently delete (cannot be reactivated).
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupAdService")
+
+    operation = client.get_type("AdGroupAdOperation")
+    ad_group_ad = operation.update
+    ad_group_ad.resource_name = (
+        f"customers/{customer_id}/adGroupAds/{ad_group_id}~{ad_id}"
+    )
+
+    enum_ = client.enums.AdGroupAdStatusEnum
+    if status == "ENABLED":
+        ad_group_ad.status = enum_.ENABLED
+    elif status == "PAUSED":
+        ad_group_ad.status = enum_.PAUSED
+    elif status == "REMOVED":
+        ad_group_ad.status = enum_.REMOVED
+    else:
+        return f"Error: invalid status '{status}'. Use ENABLED, PAUSED, or REMOVED."
+
+    operation.update_mask.CopyFrom(
+        field_mask_pb2.FieldMask(paths=["status"])
+    )
+
+    response = service.mutate_ad_group_ads(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+    return (
+        f"OK: Ad {ad_id} in ad_group {ad_group_id} is now {status}. "
+        f"Resource: {response.results[0].resource_name}"
     )
 
