@@ -23,6 +23,7 @@
 #   - set_ad_group_ad_status              (enable/pause/remove a single ad — required to retire an RSA)
 #   - create_customer_match_list            (create an empty CRM-based Customer Match user list)
 #   - upload_customer_match_members         (hash + upload emails/phones into a Customer Match list, async job)
+#   - remove_user_list                      (permanently delete an orphaned/unused user list)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -1367,3 +1368,33 @@ def upload_customer_match_members(
         f"  Status: processando de forma assíncrona no Google Ads (minutos a poucas horas).\n"
         f"  Verifique o tamanho da lista depois via list_user_lists(customer_id) — campo 'Tamanho Search'."
     )
+
+
+@mcp.tool()
+def remove_user_list(
+    customer_id: str,
+    user_list_id: str,
+) -> str:
+    """Permanently remove a user list (Customer Match / remarketing list) from the account.
+
+    Use this to clean up orphaned or unused lists — e.g. a Customer Match list
+    that was created but never received members due to an upload blocker.
+    This does not affect any other user lists or the audiences that reference
+    them; if this list is still attached as an audience signal somewhere,
+    remove/replace that signal first.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        user_list_id: The numeric ID of the user list to remove (from list_user_lists)
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("UserListService")
+
+    operation = client.get_type("UserListOperation")
+    operation.remove = f"customers/{customer_id}/userLists/{user_list_id}"
+
+    response = service.mutate_user_lists(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+    return f"OK: user list {user_list_id} removida. Resource: {response.results[0].resource_name}"
