@@ -21,6 +21,8 @@
 #   - set_campaign_geo_target_type         (change positive geo target type, e.g. PRESENCE_OR_INTEREST → PRESENCE)
 #   - set_recommendation_subscription_status (enable/pause an account-level recommendation auto-apply)
 #   - set_ad_group_ad_status              (enable/pause/remove a single ad — required to retire an RSA)
+#   - create_customer_match_list            (create an empty CRM-based Customer Match user list)
+#   - upload_customer_match_members         (hash + upload emails/phones into a Customer Match list, async job)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -1213,3 +1215,155 @@ def set_ad_group_ad_status(
         f"Resource: {response.results[0].resource_name}"
     )
 
+
+
+@mcp.tool()
+def create_customer_match_list(
+    customer_id: str,
+    list_name: str,
+    description: str = "",
+) -> str:
+    """Create a new Customer Match user list (CRM-based, contact-info upload key).
+
+    This creates an empty list container in the account. It does NOT upload any
+    members — call upload_customer_match_members() afterwards with the returned
+    user_list_id to populate it with hashed customer emails/phones. Once populated,
+    attach it to a Performance Max asset group as an audience signal via
+    add_asset_group_audience_signal() or set_asset_group_audience_signals() so
+    the algorithm learns from real customer profiles.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        list_name: Display name for the list (e.g. 'Lensshop — Clientes (base completa)')
+        description: Optional description shown in the Audience Manager UI
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("UserListService")
+
+    operation = client.get_type("UserListOperation")
+    user_list = operation.create
+    user_list.name = list_name
+    user_list.description = description or f"Customer Match list created via MCP for {list_name}"
+    # 540 = API max (field is ignored for CRM-based/Customer Match lists anyway,
+    # but the API still validates the range on write)
+    user_list.membership_life_span = 540
+    user_list.crm_based_user_list.upload_key_type = (
+        client.enums.CustomerMatchUploadKeyTypeEnum.CONTACT_INFO
+    )
+    user_list.crm_based_user_list.data_source_type = (
+        client.enums.UserListCrmDataSourceTypeEnum.FIRST_PARTY
+    )
+
+    response = service.mutate_user_lists(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+    resource_name = response.results[0].resource_name
+    list_id = resource_name.split("/")[-1]
+
+    return (
+        f"OK: Customer Match list '{list_name}' created (initially empty).\n"
+        f"  user_list_id: {list_id}\n"
+        f"  Resource: {resource_name}\n"
+        f"  Próximo passo: upload_customer_match_members(customer_id, user_list_id='{list_id}', emails=[...])"
+    )
+
+
+@mcp.tool()
+def upload_customer_match_members(
+    customer_id: str,
+    user_list_id: str,
+    emails: list[str] = None,
+    phone_numbers: list[str] = None,
+) -> str:
+    """Upload hashed customer contact data into an existing Customer Match list.
+
+    Emails and phone numbers are normalized and hashed with SHA-256 before
+    leaving this server — Google Ads only ever receives the hash, never the
+    raw contact info. This is additive/idempotent: re-running with a refreshed
+    customer list merges new members into the existing list without duplicating
+    or removing anyone already matched.
+
+    Processing is asynchronous on Google's side (matching can take from minutes
+    up to ~a few hours) — this tool submits the job and returns immediately
+    without waiting for it to finish.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        user_list_id: The numeric ID of the list (from create_customer_match_list
+                       or list_user_lists)
+        emails: List of raw customer email addresses (any case/whitespace — normalized here)
+        phone_numbers: List of phone numbers in E.164 format (e.g. '+5511999998888')
+    """
+    import hashlib
+
+    emails = emails or []
+    phone_numbers = phone_numbers or []
+    if not emails and not phone_numbers:
+        return "Error: forneça ao menos uma lista não vazia em emails ou phone_numbers."
+
+    def _hash(value: str) -> str:
+        return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
+
+    client = utils.get_googleads_client()
+    job_service = utils.get_googleads_service("OfflineUserDataJobService")
+
+    user_list_resource = f"customers/{customer_id}/userLists/{user_list_id}"
+
+    job = client.get_type("OfflineUserDataJob")
+    job.type_ = client.enums.OfflineUserDataJobTypeEnum.CUSTOMER_MATCH_USER_LIST
+    job.customer_match_user_list_metadata.user_list = user_list_resource
+
+    create_response = job_service.create_offline_user_data_job(
+        customer_id=str(customer_id), job=job
+    )
+    job_resource_name = create_response.resource_name
+
+    # Build one UserData operation per contact. A single contact can carry both
+    # an email and a phone if both are known for the same person, but since we
+    # receive them as two separate flat lists here, each entry becomes its own
+    # UserData (Google de-dupes/merges matches internally by underlying identity).
+    operations = []
+    for email in emails:
+        if not email or "@" not in email:
+            continue
+        op = client.get_type("OfflineUserDataJobOperation")
+        user_identifier = client.get_type("UserIdentifier")
+        user_identifier.hashed_email = _hash(email)
+        op.create.user_identifiers.append(user_identifier)
+        operations.append(op)
+
+    for phone in phone_numbers:
+        if not phone:
+            continue
+        op = client.get_type("OfflineUserDataJobOperation")
+        user_identifier = client.get_type("UserIdentifier")
+        user_identifier.hashed_phone_number = _hash(phone)
+        op.create.user_identifiers.append(user_identifier)
+        operations.append(op)
+
+    if not operations:
+        return f"Error: nenhum email/telefone válido encontrado nas listas fornecidas. Job {job_resource_name} criado mas sem operações — abortando sem rodar."
+
+    # Batch in chunks of 1000 (comfortably under Google's per-request limits)
+    CHUNK = 1000
+    total_added = 0
+    for i in range(0, len(operations), CHUNK):
+        chunk = operations[i : i + CHUNK]
+        request = client.get_type("AddOfflineUserDataJobOperationsRequest")
+        request.resource_name = job_resource_name
+        request.operations.extend(chunk)
+        request.enable_partial_failure = True
+        job_service.add_offline_user_data_job_operations(request=request)
+        total_added += len(chunk)
+
+    # Kick off async processing — do NOT block waiting for the LRO to resolve.
+    job_service.run_offline_user_data_job(resource_name=job_resource_name)
+
+    return (
+        f"OK: Job de upload enviado para a lista {user_list_id}.\n"
+        f"  Job resource: {job_resource_name}\n"
+        f"  Identificadores enviados: {total_added} ({len(emails)} email(s), {len(phone_numbers)} telefone(s) nas listas de entrada)\n"
+        f"  Status: processando de forma assíncrona no Google Ads (minutos a poucas horas).\n"
+        f"  Verifique o tamanho da lista depois via list_user_lists(customer_id) — campo 'Tamanho Search'."
+    )
