@@ -28,6 +28,10 @@
 #   - set_asset_group_status                (enable / pause a PMax asset group)
 #   - create_custom_audience_segment         (create a Custom Segment audience from keywords/URLs describing an interest)
 #   - add_asset_group_interest_signal        (add standard interest categories + custom segments as an audience signal on a PMax asset group)
+#   - set_campaign_bidding_strategy          (switch bidding strategy on an EXISTING Search campaign)
+#   - add_image_asset_to_asset_group         (add a marketing/square/portrait/ad image to an EXISTING PMax asset group)
+#   - add_sitelinks_to_campaign               (create sitelink assets and link them at campaign level)
+#   - add_callouts_to_campaign                (create callout assets and link them at campaign level)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -448,6 +452,273 @@ def add_asset_group_interest_signal(
         f"  Categorias padrão: {len(user_interest_ids)} | Segmentos personalizados: {len(custom_audience_resource_names)}\n"
         f"  Signal resource: {signal_resource}"
     )
+
+
+@mcp.tool()
+def set_campaign_bidding_strategy(
+    customer_id: str,
+    campaign_id: str,
+    bidding: Literal["MAXIMIZE_CLICKS", "TARGET_IMPRESSION_SHARE", "MAXIMIZE_CONVERSIONS"],
+    cpc_ceiling_brl: float = 2.5,
+    impression_share_percent: int = 90,
+    impression_share_location: Literal["ABSOLUTE_TOP_OF_PAGE", "TOP_OF_PAGE", "ANYWHERE_ON_PAGE"] = "ABSOLUTE_TOP_OF_PAGE",
+) -> str:
+    """Switch the bidding strategy of an EXISTING Search campaign.
+
+    Target ROAS / Target CPA are intentionally NOT offered (LensShop policy) —
+    MAXIMIZE_CONVERSIONS runs unconstrained (no target CPA).
+
+    Field-mask note: Google Ads API rejects masking the bare oneof submessage
+    (e.g. "maximize_conversions") with FIELD_HAS_SUBFIELDS — this tool masks
+    a leaf field within each branch instead (confirmed via validate_only
+    against a live campaign before shipping).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The EXISTING Search campaign ID to update
+        bidding: MAXIMIZE_CLICKS (Max Clicks w/ CPC ceiling), TARGET_IMPRESSION_SHARE
+            (brand defense), or MAXIMIZE_CONVERSIONS (unconstrained, no tCPA)
+        cpc_ceiling_brl: Max CPC ceiling in BRL for MAXIMIZE_CLICKS / TARGET_IMPRESSION_SHARE
+        impression_share_percent: Target impression share percentage (TIS only)
+        impression_share_location: Where to target the share (TIS only)
+    """
+    client = utils.get_googleads_client()
+    campaign_service = utils.get_googleads_service("CampaignService")
+
+    op = client.get_type("CampaignOperation")
+    campaign = op.update
+    campaign.resource_name = f"customers/{customer_id}/campaigns/{campaign_id}"
+
+    if bidding == "MAXIMIZE_CLICKS":
+        campaign.target_spend.cpc_bid_ceiling_micros = int(cpc_ceiling_brl * 1_000_000)
+        mask_paths = ["target_spend.cpc_bid_ceiling_micros"]
+    elif bidding == "TARGET_IMPRESSION_SHARE":
+        tis = campaign.target_impression_share
+        tis.location = client.enums.TargetImpressionShareLocationEnum[impression_share_location]
+        tis.location_fraction_micros = impression_share_percent * 10_000
+        tis.cpc_bid_ceiling_micros = int(cpc_ceiling_brl * 1_000_000)
+        mask_paths = [
+            "target_impression_share.location",
+            "target_impression_share.location_fraction_micros",
+            "target_impression_share.cpc_bid_ceiling_micros",
+        ]
+    elif bidding == "MAXIMIZE_CONVERSIONS":
+        campaign.maximize_conversions.target_cpa_micros = 0
+        mask_paths = ["maximize_conversions.target_cpa_micros"]
+    else:
+        return f"Error: bidding inválido '{bidding}'."
+
+    op.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=mask_paths))
+
+    response = campaign_service.mutate_campaigns(
+        customer_id=str(customer_id), operations=[op]
+    )
+    resource = response.results[0].resource_name
+    return (
+        f"OK: Campanha {campaign_id} agora usa {bidding}.\n"
+        f"  Resource: {resource}"
+    )
+
+
+@mcp.tool()
+def add_image_asset_to_asset_group(
+    customer_id: str,
+    asset_group_id: str,
+    image_source: str,
+    field_type: Literal[
+        "MARKETING_IMAGE", "SQUARE_MARKETING_IMAGE",
+        "PORTRAIT_MARKETING_IMAGE", "TALL_PORTRAIT_MARKETING_IMAGE", "AD_IMAGE",
+    ],
+    asset_name: str = "",
+) -> str:
+    """Upload an image and add it to an EXISTING PMax asset group.
+
+    Use this to improve Ad Strength on an asset group that already exists
+    (e.g. one created by create_asset_group with too few images) — adds ONE
+    more image on top of whatever is already linked, without touching
+    existing assets.
+
+    Ratios (the API rejects wrong ones): MARKETING_IMAGE 1.91:1 (min 600×314),
+    SQUARE_MARKETING_IMAGE 1:1 (min 300×300), PORTRAIT_MARKETING_IMAGE 4:5
+    (min 480×600), TALL_PORTRAIT_MARKETING_IMAGE 3:4 or narrower, AD_IMAGE
+    any ratio (legacy Display-style image).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        asset_group_id: The PMax asset group ID (e.g. '6734085609')
+        image_source: Local file path or public HTTPS URL to the image
+        field_type: Image slot to fill (see ratios above)
+        asset_name: Optional display name. Defaults to the filename.
+    """
+    import urllib.request
+    import os
+
+    if image_source.startswith("http://") or image_source.startswith("https://"):
+        req = urllib.request.Request(image_source, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            image_data = resp.read()
+        filename = image_source.split("/")[-1].split("?")[0] or field_type
+    else:
+        with open(image_source, "rb") as f:
+            image_data = f.read()
+        filename = os.path.basename(image_source)
+
+    name = asset_name or filename
+
+    client = utils.get_googleads_client()
+    asset_service = utils.get_googleads_service("AssetService")
+
+    asset_op = client.get_type("AssetOperation")
+    asset = asset_op.create
+    asset.name = name
+    asset.image_asset.data = image_data
+
+    asset_response = asset_service.mutate_assets(
+        customer_id=str(customer_id), operations=[asset_op]
+    )
+    asset_resource = asset_response.results[0].resource_name
+    asset_id = asset_resource.split("/")[-1]
+
+    aga_service = utils.get_googleads_service("AssetGroupAssetService")
+    aga_op = client.get_type("AssetGroupAssetOperation")
+    aga = aga_op.create
+    aga.asset_group = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+    aga.asset = asset_resource
+    aga.field_type = client.enums.AssetFieldTypeEnum[field_type]
+
+    aga_response = aga_service.mutate_asset_group_assets(
+        customer_id=str(customer_id), operations=[aga_op]
+    )
+    aga_resource = aga_response.results[0].resource_name
+
+    size_kb = len(image_data) / 1024
+    return (
+        f"OK: Imagem '{name}' ({size_kb:.1f} KB, {field_type}) adicionada ao "
+        f"asset group {asset_group_id} (assets existentes preservados).\n"
+        f"  Asset ID: {asset_id}\n"
+        f"  Asset resource: {asset_resource}\n"
+        f"  AssetGroupAsset resource: {aga_resource}"
+    )
+
+
+@mcp.tool()
+def add_sitelinks_to_campaign(
+    customer_id: str,
+    campaign_id: str,
+    sitelinks: list[dict],
+) -> str:
+    """Create sitelink assets and link them at the CAMPAIGN level.
+
+    Each sitelink appears as an extra clickable link line under the ad on the
+    search results page — free extra real estate that improves CTR.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The campaign ID to receive the sitelinks
+        sitelinks: List of dicts, each with:
+            - link_text (str, required, ≤25 chars): the clickable link label
+            - final_url (str, required): destination URL
+            - description1 (str, optional, ≤35 chars)
+            - description2 (str, optional, ≤35 chars)
+    """
+    errors = []
+    for i, sl in enumerate(sitelinks):
+        if not sl.get("link_text") or not sl.get("final_url"):
+            errors.append(f"item {i}: link_text e final_url são obrigatórios")
+            continue
+        if len(sl["link_text"]) > 25:
+            errors.append(f"item {i}: link_text > 25 chars: '{sl['link_text']}'")
+        for k in ("description1", "description2"):
+            if sl.get(k) and len(sl[k]) > 35:
+                errors.append(f"item {i}: {k} > 35 chars: '{sl[k]}'")
+    if errors:
+        return "Erro de validação — nada foi criado:\n" + "\n".join(f"  - {e}" for e in errors)
+
+    client = utils.get_googleads_client()
+    asset_service = utils.get_googleads_service("AssetService")
+
+    asset_ops = []
+    for sl in sitelinks:
+        op = client.get_type("AssetOperation")
+        a = op.create
+        a.final_urls.append(sl["final_url"])
+        a.sitelink_asset.link_text = sl["link_text"]
+        if sl.get("description1"):
+            a.sitelink_asset.description1 = sl["description1"]
+        if sl.get("description2"):
+            a.sitelink_asset.description2 = sl["description2"]
+        asset_ops.append(op)
+
+    asset_resp = asset_service.mutate_assets(customer_id=str(customer_id), operations=asset_ops)
+    created = [r.resource_name for r in asset_resp.results]
+
+    ca_service = utils.get_googleads_service("CampaignAssetService")
+    ca_ops = []
+    for res in created:
+        op = client.get_type("CampaignAssetOperation")
+        ca = op.create
+        ca.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
+        ca.asset = res
+        ca.field_type = client.enums.AssetFieldTypeEnum.SITELINK
+        ca_ops.append(op)
+
+    ca_resp = ca_service.mutate_campaign_assets(customer_id=str(customer_id), operations=ca_ops)
+
+    lines = [f"OK: {len(created)} sitelink(s) criado(s) e vinculado(s) à campanha {campaign_id}."]
+    for sl, res in zip(sitelinks, created):
+        lines.append(f"  '{sl['link_text']}' -> {sl['final_url']} ({res})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def add_callouts_to_campaign(
+    customer_id: str,
+    campaign_id: str,
+    callout_texts: list[str],
+) -> str:
+    """Create callout assets and link them at the CAMPAIGN level.
+
+    Callouts are short non-clickable highlight phrases shown under the ad
+    (e.g. "Frete Grátis", "Nota Fiscal") — free extra real estate on the SERP.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The campaign ID to receive the callouts
+        callout_texts: List of short phrases, each ≤25 chars
+    """
+    errors = [f"'{t}' tem {len(t)} chars (máx 25)" for t in callout_texts if len(t) > 25]
+    if errors:
+        return "Erro de validação — nada foi criado:\n" + "\n".join(f"  - {e}" for e in errors)
+
+    client = utils.get_googleads_client()
+    asset_service = utils.get_googleads_service("AssetService")
+
+    asset_ops = []
+    for text in callout_texts:
+        op = client.get_type("AssetOperation")
+        a = op.create
+        a.callout_asset.callout_text = text
+        asset_ops.append(op)
+
+    asset_resp = asset_service.mutate_assets(customer_id=str(customer_id), operations=asset_ops)
+    created = [r.resource_name for r in asset_resp.results]
+
+    ca_service = utils.get_googleads_service("CampaignAssetService")
+    ca_ops = []
+    for res in created:
+        op = client.get_type("CampaignAssetOperation")
+        ca = op.create
+        ca.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
+        ca.asset = res
+        ca.field_type = client.enums.AssetFieldTypeEnum.CALLOUT
+        ca_ops.append(op)
+
+    ca_resp = ca_service.mutate_campaign_assets(customer_id=str(customer_id), operations=ca_ops)
+
+    lines = [f"OK: {len(created)} callout(s) criado(s) e vinculado(s) à campanha {campaign_id}."]
+    for text, res in zip(callout_texts, created):
+        lines.append(f"  '{text}' ({res})")
+    return "\n".join(lines)
 
 
 @mcp.tool()
