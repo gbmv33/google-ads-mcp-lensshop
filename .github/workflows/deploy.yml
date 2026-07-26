@@ -13,11 +13,12 @@ jobs:
         run: |
           PAYLOAD='{"ref":"lensshop/mutate-tools"}'
           SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.DEPLOY_WEBHOOK_SECRET }}" | sed 's/.*= //')
-          curl -sS -X POST \
+          # Connect straight to the VPS origin IP, bypassing Cloudflare's
+          # managed challenge (which 403s datacenter/GitHub-runner IPs).
+          # The HMAC signature above is what actually authenticates the request.
+          curl -sf -X POST \
+            --resolve lensconfig.redeastrum.com.br:443:72.60.163.179 \
             -H "Content-Type: application/json" \
             -H "X-Hub-Signature-256: sha256=${SIG}" \
             -d "$PAYLOAD" \
-            -D - -o /tmp/resp \
-            -w "\nHTTP_CODE=%{http_code}\n" \
             https://lensconfig.redeastrum.com.br/ads-deploy
-          echo "--- body ---"; cat /tmp/resp
