@@ -26,6 +26,8 @@
 #   - remove_user_list                      (permanently delete an orphaned/unused user list)
 #   - create_asset_group                    (create a new PMax asset group in an existing campaign: text + image assets + listing group filter)
 #   - set_asset_group_status                (enable / pause a PMax asset group)
+#   - create_custom_audience_segment         (create a Custom Segment audience from keywords/URLs describing an interest)
+#   - add_asset_group_interest_signal        (add standard interest categories + custom segments as an audience signal on a PMax asset group)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -282,6 +284,170 @@ def set_asset_group_status(
 
     resource = response.results[0].resource_name
     return f"OK: Asset group {asset_group_id} is now {status}. Resource: {resource}"
+
+
+@mcp.tool()
+def create_custom_audience_segment(
+    customer_id: str,
+    name: str,
+    keywords: list[str] = None,
+    urls: list[str] = None,
+    audience_type: Literal["INTEREST", "SEARCH"] = "INTEREST",
+    description: str = "",
+) -> str:
+    """Create a Custom Segment (custom_audience) from keywords and/or URLs.
+
+    Use this for niche interests that have no standard Google affinity/in-market
+    category — e.g. a specific local event, subculture, or community (Brazilian
+    otaku meetups, cosplay conventions, etc). Google infers the audience from
+    people whose search history / browsing matches the given keywords and sites.
+
+    INTEREST type: broader, interest-based (people generally into the topic).
+    SEARCH type: narrower, based on what people have recently searched for on
+    Google (higher intent, closer to in-market behaviour).
+
+    Pass the returned resource_name to add_asset_group_interest_signal()'s
+    custom_audience_resource_names argument to attach it to a PMax asset group.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        name: Display name for the segment (e.g. '[Cosplay] Bailão Otaku & Eventos')
+        keywords: Terms describing the interest (e.g. ['cosplay', 'bailão otaku',
+            'convenção de anime', 'anime convention'])
+        urls: Optional site URLs whose visitors/topic describe the interest
+            (e.g. ['crunchyroll.com', 'animenewsnetwork.com'])
+        audience_type: INTEREST (broad, default) or SEARCH (recent search intent)
+        description: Optional description shown in Audience Manager
+    """
+    keywords = keywords or []
+    urls = urls or []
+    if not keywords and not urls:
+        return "Error: forneça ao menos uma keyword ou URL."
+
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("CustomAudienceService")
+
+    op = client.get_type("CustomAudienceOperation")
+    ca = op.create
+    ca.name = name
+    if description:
+        ca.description = description
+
+    type_map = {
+        "INTEREST": client.enums.CustomAudienceTypeEnum.INTEREST,
+        "SEARCH": client.enums.CustomAudienceTypeEnum.SEARCH,
+    }
+    ca.type_ = type_map[audience_type]
+
+    for kw in keywords:
+        member = client.get_type("CustomAudienceMember")
+        member.member_type = client.enums.CustomAudienceMemberTypeEnum.KEYWORD
+        member.keyword = kw
+        ca.members.append(member)
+    for url in urls:
+        member = client.get_type("CustomAudienceMember")
+        member.member_type = client.enums.CustomAudienceMemberTypeEnum.URL
+        member.url = url
+        ca.members.append(member)
+
+    response = service.mutate_custom_audiences(
+        customer_id=str(customer_id), operations=[op]
+    )
+    resource_name = response.results[0].resource_name
+    ca_id = resource_name.split("/")[-1]
+
+    return (
+        f"OK: Custom segment '{name}' criado (tipo {audience_type}).\n"
+        f"  ID: {ca_id}\n"
+        f"  Resource: {resource_name}\n"
+        f"  Membros: {len(keywords)} keyword(s), {len(urls)} URL(s)\n"
+        f"  Próximo passo: add_asset_group_interest_signal(customer_id, asset_group_id, "
+        f"custom_audience_resource_names=['{resource_name}'])"
+    )
+
+
+@mcp.tool()
+def add_asset_group_interest_signal(
+    customer_id: str,
+    asset_group_id: str,
+    user_interest_ids: list[str] = None,
+    custom_audience_resource_names: list[str] = None,
+    audience_name: str = "",
+) -> str:
+    """Add an interest-based audience signal to a PMax asset group.
+
+    Combines standard Google interest categories (affinity / in-market, by
+    numeric ID) and/or custom segments (from create_custom_audience_segment)
+    into ONE new Audience with OR logic between all of them, then attaches it
+    as an additional signal on the asset group. Existing signals on the asset
+    group are left untouched — PMax asset groups support multiple signals.
+
+    Use search(resource='user_interest', conditions=["user_interest.name LIKE "
+    "'%topic%'"]) to discover standard category IDs (prefer taxonomy_type
+    AFFINITY or IN_MARKET — VERTICAL_GEO categories are for content/topic
+    targeting, not audience signals).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        asset_group_id: The PMax asset group ID (e.g. '6734085609')
+        user_interest_ids: Numeric user_interest IDs (e.g. ['80430', '92914'])
+        custom_audience_resource_names: Full resource names from
+            create_custom_audience_segment (e.g.
+            ['customers/5521940727/customAudiences/754999999'])
+        audience_name: Optional display name. Defaults to
+            '[MCP Signal] Interests <asset_group_id>'.
+    """
+    user_interest_ids = user_interest_ids or []
+    custom_audience_resource_names = custom_audience_resource_names or []
+    if not user_interest_ids and not custom_audience_resource_names:
+        return (
+            "Error: forneça ao menos um user_interest_id ou "
+            "custom_audience_resource_name."
+        )
+
+    client = utils.get_googleads_client()
+    audience_service = utils.get_googleads_service("AudienceService")
+
+    name = audience_name or f"[MCP Signal] Interests {asset_group_id}"
+    op = client.get_type("AudienceOperation")
+    aud = op.create
+    aud.name = name
+
+    # All segments live in ONE dimension so they combine with OR semantics,
+    # even though they are different segment types (user_interest + custom_audience).
+    dim = client.get_type("AudienceDimension")
+    for uid in user_interest_ids:
+        seg = client.get_type("AudienceSegment")
+        seg.user_interest.user_interest = f"customers/{customer_id}/userInterests/{uid}"
+        dim.audience_segments.segments.append(seg)
+    for ca_resource in custom_audience_resource_names:
+        seg = client.get_type("AudienceSegment")
+        seg.custom_audience.custom_audience = ca_resource
+        dim.audience_segments.segments.append(seg)
+    aud.dimensions.append(dim)
+
+    aud_response = audience_service.mutate_audiences(
+        customer_id=str(customer_id), operations=[op]
+    )
+    audience_resource = aud_response.results[0].resource_name
+
+    signal_service = utils.get_googleads_service("AssetGroupSignalService")
+    signal_op = client.get_type("AssetGroupSignalOperation")
+    signal = signal_op.create
+    signal.asset_group = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+    signal.audience.audience = audience_resource
+
+    sig_response = signal_service.mutate_asset_group_signals(
+        customer_id=str(customer_id), operations=[signal_op]
+    )
+    signal_resource = sig_response.results[0].resource_name
+
+    return (
+        f"OK: Sinal de audiência por interesse adicionado ao asset group {asset_group_id}.\n"
+        f"  Audience criada: {audience_resource}\n"
+        f"  Categorias padrão: {len(user_interest_ids)} | Segmentos personalizados: {len(custom_audience_resource_names)}\n"
+        f"  Signal resource: {signal_resource}"
+    )
 
 
 @mcp.tool()
