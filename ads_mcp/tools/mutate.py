@@ -25,6 +25,7 @@
 #   - upload_customer_match_members         (hash + upload emails/phones into a Customer Match list, async job)
 #   - remove_user_list                      (permanently delete an orphaned/unused user list)
 #   - create_asset_group                    (create a new PMax asset group in an existing campaign: text + image assets + listing group filter)
+#   - set_asset_group_status                (enable / pause a PMax asset group)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -239,6 +240,48 @@ def rename_asset_group(
 
     resource = response.results[0].resource_name
     return f"OK: Asset group {asset_group_id} renamed to '{new_name}'. Resource: {resource}"
+
+
+@mcp.tool()
+def set_asset_group_status(
+    customer_id: str,
+    asset_group_id: str,
+    status: Literal["ENABLED", "PAUSED"],
+) -> str:
+    """Enable or pause a Performance Max asset group.
+
+    Use this to take an asset group live (ENABLED) after reviewing it, or to
+    pause it (PAUSED) so it stops serving. The asset group must already meet the
+    minimum asset requirements to be eligible when ENABLED.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        asset_group_id: The PMax asset group ID (e.g. '6734085609')
+        status: New status — ENABLED to activate, PAUSED to pause
+    """
+    client = utils.get_googleads_client()
+    ag_service = utils.get_googleads_service("AssetGroupService")
+
+    operation = client.get_type("AssetGroupOperation")
+    ag = operation.update
+    ag.resource_name = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+
+    if status == "ENABLED":
+        ag.status = client.enums.AssetGroupStatusEnum.ENABLED
+    elif status == "PAUSED":
+        ag.status = client.enums.AssetGroupStatusEnum.PAUSED
+    else:
+        return f"Error: invalid status '{status}'. Use ENABLED or PAUSED."
+
+    operation.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
+
+    response = ag_service.mutate_asset_groups(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+
+    resource = response.results[0].resource_name
+    return f"OK: Asset group {asset_group_id} is now {status}. Resource: {resource}"
 
 
 @mcp.tool()
