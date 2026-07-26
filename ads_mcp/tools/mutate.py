@@ -24,6 +24,7 @@
 #   - create_customer_match_list            (create an empty CRM-based Customer Match user list)
 #   - upload_customer_match_members         (hash + upload emails/phones into a Customer Match list, async job)
 #   - remove_user_list                      (permanently delete an orphaned/unused user list)
+#   - create_asset_group                    (create a new PMax asset group in an existing campaign: text + image assets + listing group filter)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -1398,3 +1399,217 @@ def remove_user_list(
         operations=[operation],
     )
     return f"OK: user list {user_list_id} removida. Resource: {response.results[0].resource_name}"
+
+
+@mcp.tool()
+def create_asset_group(
+    customer_id: str,
+    campaign_id: str,
+    name: str,
+    final_url: str,
+    headlines: list[str],
+    long_headlines: list[str],
+    descriptions: list[str],
+    marketing_images: list[str] = None,
+    square_marketing_images: list[str] = None,
+    portrait_marketing_images: list[str] = None,
+    business_name: str = "",
+    logo_images: list[str] = None,
+    status: Literal["ENABLED", "PAUSED"] = "PAUSED",
+    include_all_products: bool = True,
+    path1: str = "",
+    path2: str = "",
+) -> str:
+    """Create a new asset group inside an EXISTING Performance Max campaign.
+
+    Pre-creates every text/image asset as a real resource (so image/text dedup is
+    handled transparently by the API), then atomically creates the asset group,
+    links all assets, and — for Merchant Center / Shopping PMax — adds the root
+    listing group filter (UNIT_INCLUDED = all products) in a single mutate.
+
+    Created PAUSED by default so the account owner can review before serving.
+
+    Minimum required assets (enforced here before the API call):
+    - headlines: 3–15, each ≤ 30 chars
+    - long_headlines: 1–5, each ≤ 90 chars
+    - descriptions: 2–5, each ≤ 90 chars (keep at least one ≤ 60)
+    - marketing_images (landscape 1.91:1): ≥ 1
+    - square_marketing_images (1:1): ≥ 1
+
+    Logo and business name are OPTIONAL: when the campaign has Brand Guidelines
+    enabled they live at campaign level and must be OMITTED here (leave empty).
+    Provide them only for non-Brand-Guidelines campaigns.
+
+    Images must already be at the correct aspect ratio (the API rejects wrong
+    ratios). Each image source can be:
+      - a public https URL (downloaded as-is), or
+      - "base64:<data>" for inline bytes you cropped yourself.
+    Ratios: MARKETING_IMAGE 1.91:1 (min 600×314), SQUARE 1:1 (min 300×300),
+    PORTRAIT 4:5 (min 480×600), LOGO 1:1.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The EXISTING PMax campaign ID to add the asset group to
+        name: Display name for the new asset group
+        final_url: Landing page URL (e.g. a collection page)
+        headlines: 3–15 headlines, each ≤ 30 chars
+        long_headlines: 1–5 long headlines, each ≤ 90 chars
+        descriptions: 2–5 descriptions, each ≤ 90 chars
+        marketing_images: landscape 1.91:1 image sources (URL or base64:), ≥ 1
+        square_marketing_images: square 1:1 image sources, ≥ 1
+        portrait_marketing_images: optional portrait 4:5 image sources
+        business_name: only for non-Brand-Guidelines campaigns (≤ 25 chars)
+        logo_images: optional 1:1 logo sources — only for non-Brand-Guidelines campaigns
+        status: ENABLED or PAUSED (default PAUSED — recommended for review)
+        include_all_products: create the root listing group filter (needed for
+            Merchant Center / Shopping PMax; set False for feed-less PMax)
+        path1: optional display URL path segment
+        path2: optional second display URL path segment (requires path1)
+    """
+    import urllib.request
+    import base64 as _b64
+
+    marketing_images = marketing_images or []
+    square_marketing_images = square_marketing_images or []
+    portrait_marketing_images = portrait_marketing_images or []
+    logo_images = logo_images or []
+
+    # ---------- validation ----------
+    errs = []
+    if not (3 <= len(headlines) <= 15):
+        errs.append(f"headlines: {len(headlines)} fornecidos (precisa 3–15)")
+    for h in headlines:
+        if len(h) > 30:
+            errs.append(f"HEADLINE > 30 chars ({len(h)}): '{h}'")
+    if not (1 <= len(long_headlines) <= 5):
+        errs.append(f"long_headlines: {len(long_headlines)} fornecidos (precisa 1–5)")
+    for h in long_headlines:
+        if len(h) > 90:
+            errs.append(f"LONG_HEADLINE > 90 chars ({len(h)}): '{h}'")
+    if not (2 <= len(descriptions) <= 5):
+        errs.append(f"descriptions: {len(descriptions)} fornecidas (precisa 2–5)")
+    for d in descriptions:
+        if len(d) > 90:
+            errs.append(f"DESCRIPTION > 90 chars ({len(d)}): '{d}'")
+    if len(marketing_images) < 1:
+        errs.append("marketing_images (paisagem 1.91:1): precisa de pelo menos 1")
+    if len(square_marketing_images) < 1:
+        errs.append("square_marketing_images (quadrada 1:1): precisa de pelo menos 1")
+    if business_name and len(business_name) > 25:
+        errs.append(f"business_name > 25 chars ({len(business_name)})")
+    if errs:
+        return "Erro de validação — nada foi criado:\n" + "\n".join(f"  - {e}" for e in errs)
+
+    client = utils.get_googleads_client()
+    enums = client.enums
+
+    def _load_image(src: str) -> bytes:
+        if src.startswith("base64:"):
+            return _b64.b64decode(src[len("base64:"):])
+        if src.startswith("http://") or src.startswith("https://"):
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                return resp.read()
+        with open(src, "rb") as f:
+            return f.read()
+
+    # Ordered plan of (kind, value, field_type_enum, label)
+    plan = []
+    for t in headlines:
+        plan.append(("text", t, enums.AssetFieldTypeEnum.HEADLINE, f"HEADLINE '{t}'"))
+    for t in long_headlines:
+        plan.append(("text", t, enums.AssetFieldTypeEnum.LONG_HEADLINE, f"LONG_HEADLINE '{t}'"))
+    for t in descriptions:
+        plan.append(("text", t, enums.AssetFieldTypeEnum.DESCRIPTION, f"DESCRIPTION '{t}'"))
+    if business_name:
+        plan.append(("text", business_name, enums.AssetFieldTypeEnum.BUSINESS_NAME, f"BUSINESS_NAME '{business_name}'"))
+    for src in marketing_images:
+        plan.append(("image", src, enums.AssetFieldTypeEnum.MARKETING_IMAGE, "MARKETING_IMAGE"))
+    for src in square_marketing_images:
+        plan.append(("image", src, enums.AssetFieldTypeEnum.SQUARE_MARKETING_IMAGE, "SQUARE_MARKETING_IMAGE"))
+    for src in portrait_marketing_images:
+        plan.append(("image", src, enums.AssetFieldTypeEnum.PORTRAIT_MARKETING_IMAGE, "PORTRAIT_MARKETING_IMAGE"))
+    for src in logo_images:
+        plan.append(("image", src, enums.AssetFieldTypeEnum.LOGO, "LOGO"))
+
+    # ---------- Phase 1: pre-create all assets (real resources; dedup-safe) ----------
+    asset_service = utils.get_googleads_service("AssetService")
+    asset_ops = []
+    for idx, (kind, value, _ft, label) in enumerate(plan):
+        op = client.get_type("AssetOperation")
+        a = op.create
+        if kind == "text":
+            a.text_asset.text = value
+        else:
+            data = _load_image(value)
+            a.name = f"{name} — {label} #{idx} ({len(data)}b)"[:120]
+            a.image_asset.data = data
+        asset_ops.append(op)
+
+    asset_resp = asset_service.mutate_assets(
+        customer_id=str(customer_id), operations=asset_ops
+    )
+    created = [r.resource_name for r in asset_resp.results]
+
+    # ---------- Phase 2: atomic mutate — asset group + links + listing filter ----------
+    ga_service = utils.get_googleads_service("GoogleAdsService")
+    ag_temp = f"customers/{customer_id}/assetGroups/-1"
+    mutate_ops = []
+
+    op = client.get_type("MutateOperation")
+    ag = op.asset_group_operation.create
+    ag.resource_name = ag_temp
+    ag.name = name
+    ag.campaign = f"customers/{customer_id}/campaigns/{campaign_id}"
+    ag.final_urls.append(final_url)
+    if path1:
+        ag.path1 = path1
+        if path2:
+            ag.path2 = path2
+    ag.status = (
+        enums.AssetGroupStatusEnum.ENABLED
+        if status == "ENABLED"
+        else enums.AssetGroupStatusEnum.PAUSED
+    )
+    mutate_ops.append(op)
+
+    for (kind, value, ft, label), res in zip(plan, created):
+        link_op = client.get_type("MutateOperation")
+        aga = link_op.asset_group_asset_operation.create
+        aga.asset_group = ag_temp
+        aga.asset = res
+        aga.field_type = ft
+        mutate_ops.append(link_op)
+
+    if include_all_products:
+        lgf_op = client.get_type("MutateOperation")
+        lgf = lgf_op.asset_group_listing_group_filter_operation.create
+        lgf.asset_group = ag_temp
+        lgf.type_ = enums.ListingGroupFilterTypeEnum.UNIT_INCLUDED
+        try:
+            lgf.listing_source = enums.ListingGroupFilterListingSourceEnum.SHOPPING
+        except Exception:
+            pass
+        mutate_ops.append(lgf_op)
+
+    response = ga_service.mutate(
+        customer_id=str(customer_id), mutate_operations=mutate_ops
+    )
+
+    ag_resource = response.mutate_operation_responses[0].asset_group_result.resource_name
+    new_ag_id = ag_resource.split("/")[-1]
+
+    n_text = sum(1 for k, *_ in plan if k == "text")
+    n_img = sum(1 for k, *_ in plan if k == "image")
+    lines = [
+        f"OK: Asset group '{name}' criado na campanha {campaign_id} (status {status}).",
+        f"  Asset group ID: {new_ag_id}",
+        f"  Resource: {ag_resource}",
+        f"  Final URL: {final_url}",
+        f"  Assets vinculados: {len(created)} ({n_text} texto, {n_img} imagem)",
+        f"    Headlines: {len(headlines)} | Long headlines: {len(long_headlines)} | Descriptions: {len(descriptions)}",
+        f"    Marketing(1.91:1): {len(marketing_images)} | Square(1:1): {len(square_marketing_images)} | Portrait(4:5): {len(portrait_marketing_images)}",
+        f"  Listing group filter (todos os produtos): {'sim' if include_all_products else 'não'}",
+        f"  Revise e ative pela interface do Google Ads quando aprovar.",
+    ]
+    return "\n".join(lines)
