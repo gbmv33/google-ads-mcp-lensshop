@@ -418,7 +418,7 @@ def add_asset_group_interest_signal(
     dim = client.get_type("AudienceDimension")
     for uid in user_interest_ids:
         seg = client.get_type("AudienceSegment")
-        seg.user_interest.user_interest = f"customers/{customer_id}/userInterests/{uid}"
+        seg.user_interest.user_interest_category = f"customers/{customer_id}/userInterests/{uid}"
         dim.audience_segments.segments.append(seg)
     for ca_resource in custom_audience_resource_names:
         seg = client.get_type("AudienceSegment")
