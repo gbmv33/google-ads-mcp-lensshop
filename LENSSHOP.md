@@ -70,8 +70,10 @@ O webhook executa `/root/google-ads-mcp/deploy.sh`:
 2. `pip install -e .` (atualiza dependências)
 3. `pm2 restart google-ads-mcp`
 
-**Secret do GitHub Actions:** `DEPLOY_WEBHOOK_SECRET` = `lensshop-deploy-secret-2026`
-→ Configurar em: `github.com/gbmv33/google-ads-mcp-lensshop` → Settings → Secrets → Actions
+**Secret do GitHub Actions:** `DEPLOY_WEBHOOK_SECRET` — valor rotacionado em 27/07/2026 após
+exposição acidental neste arquivo. NÃO documentar o valor aqui novamente.
+→ Configurado em: `github.com/gbmv33/google-ads-mcp-lensshop` → Settings → Secrets → Actions
+→ Mesmo valor precisa bater com `WEBHOOK_SECRET` em `/root/google-ads-mcp/ecosystem.config.js` na VPS.
 
 ---
 
@@ -116,7 +118,11 @@ curl http://localhost:8090/mcp
 
 1. Acessar [claude.ai/customize/connectors](https://claude.ai/customize/connectors)
 2. Adicionar conector MCP com URL: `https://ads-mcp.redeastrum.com.br/mcp`
-3. Tipo de autenticação: nenhuma (protegido por nginx)
+3. **Autenticação obrigatória (desde 27/07/2026):** adicionar header customizado
+   `X-MCP-Token: <valor>`. O endpoint responde 401 sem esse header — isso é
+   proposital (antes ficava sem nenhuma autenticação, já corrigido).
+   Valor do token: NÃO documentado aqui — pedir ao Gabriel ou ver
+   `/etc/nginx/sites-available/ads-mcp` na VPS.
 
 ---
 
