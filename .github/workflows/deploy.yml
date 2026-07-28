@@ -17,7 +17,7 @@ jobs:
           # managed challenge (which 403s datacenter/GitHub-runner IPs).
           # The HMAC signature above is what actually authenticates the request.
           curl -sf -X POST \
-            --resolve lensconfig.redeastrum.com.br:443:72.60.163.179 \
+            --resolve lensconfig.redeastrum.com.br:443:179.198.101.126 \
             -H "Content-Type: application/json" \
             -H "X-Hub-Signature-256: sha256=${SIG}" \
             -d "$PAYLOAD" \
