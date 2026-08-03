@@ -32,6 +32,7 @@
 #   - add_image_asset_to_asset_group         (add a marketing/square/portrait/ad image to an EXISTING PMax asset group)
 #   - add_sitelinks_to_campaign               (create sitelink assets and link them at campaign level)
 #   - add_callouts_to_campaign                (create callout assets and link them at campaign level)
+#   - update_asset_group_final_url            (change the landing page of an EXISTING PMax asset group)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -246,6 +247,45 @@ def rename_asset_group(
 
     resource = response.results[0].resource_name
     return f"OK: Asset group {asset_group_id} renamed to '{new_name}'. Resource: {resource}"
+
+
+@mcp.tool()
+def update_asset_group_final_url(
+    customer_id: str,
+    asset_group_id: str,
+    final_url: str,
+) -> str:
+    """Change the landing page (final URL) of an EXISTING PMax asset group.
+
+    Replaces the asset group's final_urls with a single new URL. Use this to
+    fix message-match (point a themed asset group at a dedicated/curated
+    collection instead of a generic catalog page) without losing the asset
+    group's accumulated learning, audience signals, or creative assets.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        asset_group_id: The asset group ID to update (e.g. '6734405544')
+        final_url: The new landing page URL (e.g. a collection page)
+    """
+    client = utils.get_googleads_client()
+    ag_service = utils.get_googleads_service("AssetGroupService")
+
+    operation = client.get_type("AssetGroupOperation")
+    ag = operation.update
+    ag.resource_name = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+    ag.final_urls.append(final_url)
+
+    operation.update_mask.CopyFrom(
+        field_mask_pb2.FieldMask(paths=["final_urls"])
+    )
+
+    response = ag_service.mutate_asset_groups(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+
+    resource = response.results[0].resource_name
+    return f"OK: Asset group {asset_group_id} final_url updated to '{final_url}'. Resource: {resource}"
 
 
 @mcp.tool()
