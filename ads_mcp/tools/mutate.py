@@ -2133,3 +2133,35 @@ def create_asset_group(
         f"  Revise e ative pela interface do Google Ads quando aprovar.",
     ]
     return "\n".join(lines)
+
+
+@mcp.tool()
+def add_asset_group_search_theme(
+    customer_id: str,
+    asset_group_id: str,
+    search_theme_text: str,
+) -> str:
+    """Add a search theme signal to a Performance Max asset group.
+
+    Search themes tell the PMax algorithm specific search phrases/topics to
+    match against — the closest PMax equivalent to a Search-campaign keyword.
+    Up to 25 search themes are allowed per asset group.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        asset_group_id: The PMax asset group ID (e.g. '6713279038')
+        search_theme_text: The search theme phrase (e.g. 'lente de contato com grau')
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AssetGroupSignalService")
+
+    op = client.get_type("AssetGroupSignalOperation")
+    sig = op.create
+    sig.asset_group = f"customers/{customer_id}/assetGroups/{asset_group_id}"
+    sig.search_theme.text = search_theme_text
+
+    response = service.mutate_asset_group_signals(
+        customer_id=str(customer_id),
+        operations=[op],
+    )
+    return f"OK: search theme '{search_theme_text}' adicionado ao asset group {asset_group_id}. Resource: {response.results[0].resource_name}"
