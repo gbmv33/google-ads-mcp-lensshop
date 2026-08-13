@@ -2165,3 +2165,49 @@ def add_asset_group_search_theme(
         operations=[op],
     )
     return f"OK: search theme '{search_theme_text}' adicionado ao asset group {asset_group_id}. Resource: {response.results[0].resource_name}"
+
+
+@mcp.tool()
+def set_keyword_status(
+    customer_id: str,
+    ad_group_id: str,
+    criterion_id: str,
+    status: Literal["ENABLED", "PAUSED", "REMOVED"],
+) -> str:
+    """Enable, pause, or remove a single keyword within an ad group.
+
+    Use this to take a low-Quality-Score or underperforming keyword out of
+    rotation without losing its historical data (PAUSED, reversible) or to
+    delete it permanently (REMOVED).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        ad_group_id: The ad group ID containing the keyword (e.g. '196940702306')
+        criterion_id: The numeric ad_group_criterion ID (e.g. '40743568336')
+        status: New status. ENABLED to activate, PAUSED to take out of rotation
+                (reversible), REMOVED to permanently delete.
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service("AdGroupCriterionService")
+
+    operation = client.get_type("AdGroupCriterionOperation")
+    criterion = operation.update
+    criterion.resource_name = (
+        f"customers/{customer_id}/adGroupCriteria/{ad_group_id}~{criterion_id}"
+    )
+
+    enum_ = client.enums.AdGroupCriterionStatusEnum
+    if status == "ENABLED":
+        criterion.status = enum_.ENABLED
+    elif status == "PAUSED":
+        criterion.status = enum_.PAUSED
+    else:
+        criterion.status = enum_.REMOVED
+
+    operation.update_mask.CopyFrom(field_mask_pb2.FieldMask(paths=["status"]))
+
+    response = service.mutate_ad_group_criteria(
+        customer_id=str(customer_id),
+        operations=[operation],
+    )
+    return f"OK: keyword criterion {criterion_id} set to {status}. Resource: {response.results[0].resource_name}"
