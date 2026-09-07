@@ -2219,7 +2219,7 @@ def set_keyword_status(
 def add_customer_negative_placements(
     customer_id: str,
     placement_urls: list[str] | None = None,
-    exclude_all_mobile_apps: bool = False,
+    mobile_app_category_ids: list[str] | None = None,
 ) -> str:
     """Add ACCOUNT-LEVEL negative placements (excluded placements).
 
@@ -2232,8 +2232,10 @@ def add_customer_negative_placements(
         customer_id: The customer/account ID without hyphens (e.g. '5521940727')
         placement_urls: Website domains to exclude, bare domain form
             (e.g. ['taboolanews.com', 'glance.com'])
-        exclude_all_mobile_apps: If True, also excludes the entire 'All Apps'
-            mobile app category (constant 69500), blocking mobile app inventory.
+        mobile_app_category_ids: Mobile app category constant IDs to exclude
+            (e.g. ['60008'] for Google Play Games). Discover valid IDs with
+            search(resource='mobile_app_category_constant'). Note: 69500
+            ('All Apps') is NOT accepted at account level by the API.
     """
     client = utils.get_googleads_client()
     service = utils.get_googleads_service('CustomerNegativeCriterionService')
@@ -2248,16 +2250,16 @@ def add_customer_negative_placements(
         operations.append(op)
         labels.append(f'  [placement] {url}')
 
-    if exclude_all_mobile_apps:
+    for cat_id in (mobile_app_category_ids or []):
         op = client.get_type('CustomerNegativeCriterionOperation')
         op.create.mobile_app_category.mobile_app_category_constant = (
-            'mobileAppCategoryConstants/69500'
+            f'mobileAppCategoryConstants/{cat_id}'
         )
         operations.append(op)
-        labels.append('  [mobile_app_category] All Apps (69500)')
+        labels.append(f'  [mobile_app_category] {cat_id}')
 
     if not operations:
-        return 'ERRO: nada a excluir — informe placement_urls e/ou exclude_all_mobile_apps=True.'
+        return 'ERRO: nada a excluir — informe placement_urls e/ou mobile_app_category_ids.'
 
     response = service.mutate_customer_negative_criteria(
         customer_id=str(customer_id),
