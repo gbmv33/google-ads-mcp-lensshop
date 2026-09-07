@@ -33,6 +33,8 @@
 #   - add_sitelinks_to_campaign               (create sitelink assets and link them at campaign level)
 #   - add_callouts_to_campaign                (create callout assets and link them at campaign level)
 #   - update_asset_group_final_url            (change the landing page of an EXISTING PMax asset group)
+#   - add_customer_negative_placements        (ACCOUNT-level excluded placements — the only way to block junk inventory in PMax)
+#   - remove_customer_negative_criterion      (undo an account-level exclusion by criterion ID)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -2211,3 +2213,87 @@ def set_keyword_status(
         operations=[operation],
     )
     return f"OK: keyword criterion {criterion_id} set to {status}. Resource: {response.results[0].resource_name}"
+
+
+@mcp.tool()
+def add_customer_negative_placements(
+    customer_id: str,
+    placement_urls: list[str] | None = None,
+    exclude_all_mobile_apps: bool = False,
+) -> str:
+    """Add ACCOUNT-LEVEL negative placements (excluded placements).
+
+    Account-level exclusions apply to ALL campaigns in the account, including
+    Performance Max — which does not accept campaign-level placement exclusions.
+    Use this to block low-quality display / made-for-advertising (MFA) inventory
+    such as content-arbitrage domains and accidental-click mobile app inventory.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        placement_urls: Website domains to exclude, bare domain form
+            (e.g. ['taboolanews.com', 'glance.com'])
+        exclude_all_mobile_apps: If True, also excludes the entire 'All Apps'
+            mobile app category (constant 69500), blocking mobile app inventory.
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service('CustomerNegativeCriterionService')
+
+    urls = placement_urls or []
+    operations = []
+    labels = []
+
+    for url in urls:
+        op = client.get_type('CustomerNegativeCriterionOperation')
+        op.create.placement.url = url
+        operations.append(op)
+        labels.append(f'  [placement] {url}')
+
+    if exclude_all_mobile_apps:
+        op = client.get_type('CustomerNegativeCriterionOperation')
+        op.create.mobile_app_category.mobile_app_category_constant = (
+            'mobileAppCategoryConstants/69500'
+        )
+        operations.append(op)
+        labels.append('  [mobile_app_category] All Apps (69500)')
+
+    if not operations:
+        return 'ERRO: nada a excluir — informe placement_urls e/ou exclude_all_mobile_apps=True.'
+
+    response = service.mutate_customer_negative_criteria(
+        customer_id=str(customer_id),
+        operations=operations,
+    )
+
+    return (
+        f'OK: {len(response.results)} exclusao(oes) adicionada(s) em nivel de conta {customer_id}.\n'
+        + '\n'.join(labels)
+    )
+
+
+@mcp.tool()
+def remove_customer_negative_criterion(
+    customer_id: str,
+    criterion_id: str,
+) -> str:
+    """Remove an ACCOUNT-LEVEL negative criterion (undo an exclusion).
+
+    Find criterion IDs with:
+      search(resource='customer_negative_criterion',
+             fields=['customer_negative_criterion.id',
+                     'customer_negative_criterion.placement.url'])
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        criterion_id: The numeric ID of the negative criterion to remove
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service('CustomerNegativeCriterionService')
+
+    op = client.get_type('CustomerNegativeCriterionOperation')
+    op.remove = f'customers/{customer_id}/customerNegativeCriteria/{criterion_id}'
+
+    response = service.mutate_customer_negative_criteria(
+        customer_id=str(customer_id),
+        operations=[op],
+    )
+    return f'OK: exclusao {criterion_id} removida. Resource: {response.results[0].resource_name}'
