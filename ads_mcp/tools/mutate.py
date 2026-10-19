@@ -35,6 +35,7 @@
 #   - update_asset_group_final_url            (change the landing page of an EXISTING PMax asset group)
 #   - add_customer_negative_placements        (ACCOUNT-level excluded placements — the only way to block junk inventory in PMax)
 #   - remove_customer_negative_criterion      (undo an account-level exclusion by criterion ID)
+#   - remove_campaign_criterion               (remove a campaign-level criterion, e.g. a campaign negative keyword)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -2299,3 +2300,37 @@ def remove_customer_negative_criterion(
         operations=[op],
     )
     return f'OK: exclusao {criterion_id} removida. Resource: {response.results[0].resource_name}'
+
+
+@mcp.tool()
+def remove_campaign_criterion(
+    customer_id: str,
+    campaign_id: str,
+    criterion_id: str,
+) -> str:
+    """Remove a CAMPAIGN-LEVEL criterion, e.g. a campaign negative keyword.
+
+    Find criterion IDs with:
+      search(resource='campaign_criterion',
+             fields=['campaign_criterion.criterion_id',
+                     'campaign_criterion.keyword.text',
+                     'campaign_criterion.keyword.match_type',
+                     'campaign_criterion.negative'],
+             conditions=['campaign.id = <campaign_id>'])
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        campaign_id: The campaign ID the criterion belongs to
+        criterion_id: The numeric criterion ID to remove
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service('CampaignCriterionService')
+
+    op = client.get_type('CampaignCriterionOperation')
+    op.remove = f'customers/{customer_id}/campaignCriteria/{campaign_id}~{criterion_id}'
+
+    response = service.mutate_campaign_criteria(
+        customer_id=str(customer_id),
+        operations=[op],
+    )
+    return f'OK: criterio {criterion_id} removido da campanha {campaign_id}. Resource: {response.results[0].resource_name}'
