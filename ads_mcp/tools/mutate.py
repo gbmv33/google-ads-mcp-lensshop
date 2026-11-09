@@ -36,6 +36,7 @@
 #   - add_customer_negative_placements        (ACCOUNT-level excluded placements — the only way to block junk inventory in PMax)
 #   - remove_customer_negative_criterion      (undo an account-level exclusion by criterion ID)
 #   - remove_campaign_criterion               (remove a campaign-level criterion, e.g. a campaign negative keyword)
+#   - add_customer_content_label_exclusions   (ACCOUNT-level content label exclusions: kids, games, below the fold)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
@@ -2334,3 +2335,45 @@ def remove_campaign_criterion(
         operations=[op],
     )
     return f'OK: criterio {criterion_id} removido da campanha {campaign_id}. Resource: {response.results[0].resource_name}'
+
+
+@mcp.tool()
+def add_customer_content_label_exclusions(
+    customer_id: str,
+    content_labels: list[str],
+) -> str:
+    """Exclude CONTENT LABELS at ACCOUNT level (content suitability).
+
+    Applies to all campaigns, including Performance Max. Blocks whole classes
+    of inventory (kids content, games, below-the-fold ad slots) instead of one
+    domain at a time.
+
+    Each label is sent in its own mutate, so a label the API rejects at account
+    level does not block the others. Already-excluded labels are reported as
+    errors by the API and can be ignored.
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        content_labels: ContentLabelType names, e.g. ['JUVENILE',
+            'BELOW_THE_FOLD', 'BRAND_SUITABILITY_GAMES_MATURE']
+    """
+    client = utils.get_googleads_client()
+    service = utils.get_googleads_service('CustomerNegativeCriterionService')
+    enum = client.enums.ContentLabelTypeEnum
+
+    lines = []
+    for label in content_labels:
+        name = str(label).strip().upper()
+        try:
+            op = client.get_type('CustomerNegativeCriterionOperation')
+            op.create.content_label.type_ = getattr(enum, name)
+            service.mutate_customer_negative_criteria(
+                customer_id=str(customer_id),
+                operations=[op],
+            )
+            lines.append(f'  OK   {name}')
+        except Exception as e:  # noqa: BLE001 - reporta e segue para o proximo
+            msg = str(e).replace('\n', ' ')[:200]
+            lines.append(f'  ERRO {name}: {msg}')
+
+    return f'Exclusao de content labels na conta {customer_id}:\n' + '\n'.join(lines)
