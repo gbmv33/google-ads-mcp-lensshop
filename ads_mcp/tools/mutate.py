@@ -37,9 +37,11 @@
 #   - remove_customer_negative_criterion      (undo an account-level exclusion by criterion ID)
 #   - remove_campaign_criterion               (remove a campaign-level criterion, e.g. a campaign negative keyword)
 #   - add_customer_content_label_exclusions   (ACCOUNT-level content label exclusions: kids, games, below the fold)
+#   - upload_conversion_adjustments           (RETRACT or RESTATE already-uploaded conversions by order_id; validate_only=True by default)
 
 """Tools for mutating Google Ads resources via the MCP server."""
 
+import re
 from typing import Literal
 from ads_mcp.coordinator import mcp
 import ads_mcp.utils as utils
@@ -2377,3 +2379,202 @@ def add_customer_content_label_exclusions(
             lines.append(f'  ERRO {name}: {msg}')
 
     return f'Exclusao de content labels na conta {customer_id}:\n' + '\n'.join(lines)
+
+
+_ADJUSTMENT_DT_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$'
+)
+_MAX_ADJUSTMENTS_PER_CALL = 2000
+
+
+def _resolve_conversion_action_resource(
+    customer_id: str, conversion_action: str
+) -> str:
+    """Returns the conversion action resource name from a numeric ID or a name."""
+    value = str(conversion_action).strip()
+    if value.isdigit():
+        return f'customers/{customer_id}/conversionActions/{value}'
+    if value.startswith(f'customers/{customer_id}/conversionActions/'):
+        return value
+    escaped = value.replace('\\', '\\\\').replace("'", "\\'")
+    ga_service = utils.get_googleads_service('GoogleAdsService')
+    rows = list(
+        ga_service.search(
+            customer_id=str(customer_id),
+            query=(
+                'SELECT conversion_action.resource_name '
+                'FROM conversion_action '
+                f"WHERE conversion_action.name = '{escaped}'"
+            ),
+        )
+    )
+    if len(rows) != 1:
+        raise ValueError(
+            f"conversion action '{value}' encontrada {len(rows)} vez(es); "
+            'use o ID numerico.'
+        )
+    return rows[0].conversion_action.resource_name
+
+
+def _validate_adjustment_row(row: dict, index: int) -> str | None:
+    """Returns an error message for an invalid input row, or None if OK."""
+    if not isinstance(row, dict):
+        return f'linha {index}: precisa ser um objeto'
+    if not str(row.get('order_id', '')).strip():
+        return f'linha {index}: order_id obrigatorio'
+    kind = str(row.get('adjustment_type', '')).strip().upper()
+    if kind not in ('RETRACTION', 'RESTATEMENT'):
+        return f'linha {index}: adjustment_type deve ser RETRACTION ou RESTATEMENT'
+    when = str(row.get('adjustment_date_time', '')).strip()
+    if not _ADJUSTMENT_DT_RE.match(when):
+        return (
+            f'linha {index}: adjustment_date_time deve ser '
+            "'yyyy-mm-dd hh:mm:ss-03:00' (com fuso)"
+        )
+    value = row.get('restatement_value')
+    if kind == 'RETRACTION' and value is not None:
+        return f'linha {index}: RETRACTION nao aceita restatement_value'
+    if kind == 'RESTATEMENT':
+        try:
+            if value is None or float(value) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return f'linha {index}: RESTATEMENT exige restatement_value >= 0'
+    return None
+
+
+def _failed_indexes(client, partial_failure_error) -> dict[int, str]:
+    """Maps input row index -> error text from a partial_failure_error status."""
+    errors: dict[int, str] = {}
+    if partial_failure_error is None or not partial_failure_error.details:
+        return errors
+    failure_type = client.get_type('GoogleAdsFailure')
+    for detail in partial_failure_error.details:
+        failure = type(failure_type).deserialize(detail.value)
+        for err in failure.errors:
+            idx = None
+            for el in err.location.field_path_elements:
+                if el.field_name == 'conversion_adjustments':
+                    idx = el.index
+                    break
+            msg = (err.message or 'erro').replace('\n', ' ')[:300]
+            key = idx if idx is not None else -1
+            errors[key] = (errors[key] + ' | ' + msg) if key in errors else msg
+    return errors
+
+
+@mcp.tool()
+def upload_conversion_adjustments(
+    customer_id: str,
+    conversion_action_id: str,
+    adjustments: list[dict],
+    validate_only: bool = True,
+    currency_code: str = 'BRL',
+) -> str:
+    """RETRACT or RESTATE conversions already counted in Google Ads, by order_id.
+
+    Uses ConversionAdjustmentUploadService with partial_failure=true, so a bad
+    row does not block the others. The result lists each row as ACEITA or ERRO.
+
+    IMPORTANT: validate_only is True by default. In that mode Google only
+    validates the request and changes nothing. With validate_only=False the
+    adjustment is REAL and an accepted RETRACTION CANNOT be undone. Always run
+    with validate_only=True first and only then repeat with False.
+
+    The conversion must have been uploaded with the same order_id
+    (transaction_id), and the adjustment time must be AFTER the conversion time
+    and within the retraction window (55 days after the conversion).
+
+    Args:
+        customer_id: The customer/account ID without hyphens (e.g. '5521940727')
+        conversion_action_id: Numeric ID of the conversion action (a unique
+            exact name is also accepted)
+        adjustments: List of objects with:
+            order_id (str): the transaction_id sent with the conversion
+            adjustment_type (str): 'RETRACTION' (removes the conversion) or
+                'RESTATEMENT' (changes its value)
+            adjustment_date_time (str): 'yyyy-mm-dd hh:mm:ss-03:00' (with offset)
+            restatement_value (number, only RESTATEMENT): the new value
+        validate_only: True (default) = only validate; False = send for real
+        currency_code: Currency of restatement_value (default 'BRL')
+    """
+    if not isinstance(adjustments, list) or not adjustments:
+        return 'ERRO: adjustments vazio. Nada enviado.'
+    if len(adjustments) > _MAX_ADJUSTMENTS_PER_CALL:
+        return (
+            f'ERRO: no maximo {_MAX_ADJUSTMENTS_PER_CALL} ajustes por chamada. '
+            'Nada enviado.'
+        )
+
+    problems = [
+        e
+        for e in (
+            _validate_adjustment_row(r, i) for i, r in enumerate(adjustments)
+        )
+        if e
+    ]
+    if problems:
+        return 'ERRO de entrada. Nada enviado:\n' + '\n'.join(
+            f'  {p}' for p in problems
+        )
+
+    client = utils.get_googleads_client()
+    try:
+        action_resource = _resolve_conversion_action_resource(
+            customer_id, conversion_action_id
+        )
+    except ValueError as e:
+        return f'ERRO: {e} Nada enviado.'
+
+    service = utils.get_googleads_service('ConversionAdjustmentUploadService')
+    enum = client.enums.ConversionAdjustmentTypeEnum
+
+    ops = []
+    for row in adjustments:
+        adj = client.get_type('ConversionAdjustment')
+        adj.conversion_action = action_resource
+        adj.order_id = str(row['order_id']).strip()
+        adj.adjustment_date_time = str(row['adjustment_date_time']).strip()
+        kind = str(row['adjustment_type']).strip().upper()
+        adj.adjustment_type = getattr(enum, kind)
+        if kind == 'RESTATEMENT':
+            adj.restatement_value.adjusted_value = float(
+                row['restatement_value']
+            )
+            adj.restatement_value.currency_code = currency_code
+        ops.append(adj)
+
+    request = client.get_type('UploadConversionAdjustmentsRequest')
+    request.customer_id = str(customer_id)
+    request.conversion_adjustments.extend(ops)
+    request.partial_failure = True
+    request.validate_only = bool(validate_only)
+
+    response = service.upload_conversion_adjustments(request=request)
+    errors = _failed_indexes(client, response.partial_failure_error)
+
+    accepted = 0
+    lines = []
+    for i, row in enumerate(adjustments):
+        label = (
+            f"{str(row['order_id']).strip()} "
+            f"{str(row['adjustment_type']).strip().upper()}"
+        )
+        if i in errors:
+            lines.append(f'  ERRO   [{i}] {label}: {errors[i]}')
+        else:
+            accepted += 1
+            lines.append(f'  ACEITA [{i}] {label}')
+    if -1 in errors:
+        lines.append(f'  ERRO   (geral): {errors[-1]}')
+
+    mode = (
+        'VALIDACAO (validate_only=True): nada foi alterado na conta'
+        if validate_only
+        else 'ENVIO REAL (validate_only=False)'
+    )
+    return (
+        f'{mode}. Conta {customer_id}, conversao {action_resource}.\n'
+        f'{accepted} de {len(adjustments)} aceita(s), '
+        f'{len(adjustments) - accepted} com erro.\n' + '\n'.join(lines)
+    )
